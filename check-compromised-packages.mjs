@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import fs from 'fs';
 import path from 'path';
-import semver from 'semver';
 
 const FLAG_MAP = new Map();
 for (let i = 2; i < process.argv.length; i += 1) {
@@ -49,10 +48,8 @@ function parseCsv(filePath) {
 function normalizeRange(range = '*') {
   let normalized = (range || '*').trim();
   if (!normalized) return '*';
+  // Remove whitespace around operators but keep the operators themselves
   normalized = normalized.replace(/(<=|>=|=|<|>|~|\^)\s+/g, '$1');
-  if (normalized.startsWith('=')) {
-    normalized = normalized.slice(1);
-  }
   return normalized || '*';
 }
 
@@ -105,6 +102,66 @@ function buildVersionIndex(lockJson) {
   return versionIndex;
 }
 
+function tokenizeVersion(version = '') {
+  return String(version)
+    .split(/[.\-]/)
+    .map(part => (/^\d+$/.test(part) ? Number(part) : part));
+}
+
+function compareVersions(a = '', b = '') {
+  const left = tokenizeVersion(a);
+  const right = tokenizeVersion(b);
+  const len = Math.max(left.length, right.length);
+  for (let i = 0; i < len; i += 1) {
+    // Treat missing parts as 0 for numbers, but handle pre-release logic if needed.
+    // For simple compromised checks, 0 padding usually suffices.
+    const segA = left[i] ?? (typeof right[i] === 'number' ? 0 : '');
+    const segB = right[i] ?? (typeof left[i] === 'number' ? 0 : '');
+    
+    if (typeof segA === 'number' && typeof segB === 'number') {
+      if (segA !== segB) return segA - segB;
+      continue;
+    }
+    const strA = String(segA);
+    const strB = String(segB);
+    if (strA === strB) continue;
+    return strA > strB ? 1 : -1;
+  }
+  return 0;
+}
+
+function parseConstraint(raw = '') {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === '*') return { operator: '*' };
+  // Capture optional operator (including =) and the version
+  const match = trimmed.match(/^(>=|<=|>|<|=)?\s*v?(.+)$/);
+  if (!match) return null;
+  const [, operator, version] = match;
+  if (!version) return null;
+  return { operator: operator || '=', version };
+}
+
+function satisfiesConstraint(version, constraint) {
+  if (!constraint) return false;
+  if (constraint.operator === '*') return true;
+  const cmp = compareVersions(version, constraint.version);
+  switch (constraint.operator) {
+    case '=':
+    case undefined:
+      return cmp === 0;
+    case '>':
+      return cmp > 0;
+    case '>=':
+      return cmp >= 0;
+    case '<':
+      return cmp < 0;
+    case '<=':
+      return cmp <= 0;
+    default:
+      return false;
+  }
+}
+
 function findCompromised(versionIndex, compromisedList) {
   const findings = [];
   for (const entry of compromisedList) {
@@ -113,21 +170,21 @@ function findCompromised(versionIndex, compromisedList) {
     const versions = versionIndex.get(pkgName);
     if (!versions) continue;
 
-    const normalizedRange = normalizeRange(entry.versionRange);
-    const isWildcard = normalizedRange === '*';
-    const exactVersion = semver.valid(normalizedRange);
-    const validRange =
-      !isWildcard && !exactVersion ? semver.validRange(normalizedRange) : null;
+    const rawRange = entry.versionrange ?? entry.versionRange ?? entry.version ?? '*';
+    const normalizedRange = normalizeRange(rawRange);
+    const constraints =
+      normalizedRange === '*'
+        ? [{ operator: '*' }]
+        : normalizedRange
+            .split('||')
+            .map(part => parseConstraint(part))
+            .filter(Boolean);
 
-    const matches = [...versions].filter(ver => {
-      if (!semver.valid(ver)) return false;
-      if (isWildcard) return true;
-      if (exactVersion) return semver.eq(ver, normalizedRange);
-      if (validRange) {
-        return semver.satisfies(ver, normalizedRange, { includePrerelease: true });
-      }
-      return false;
-    });
+    if (!constraints.length) constraints.push({ operator: '*' });
+
+    const matches = [...versions].filter(ver =>
+      constraints.some(constraint => satisfiesConstraint(ver, ver && constraint)),
+    );
 
     if (matches.length) {
       findings.push({
